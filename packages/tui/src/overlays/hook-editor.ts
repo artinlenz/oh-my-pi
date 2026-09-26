@@ -23,8 +23,8 @@ export interface HookEditorOptions {
 	/**
 	 * Max rows the inner Editor may occupy. When omitted, the editor is
 	 * bounded to the current terminal height minus the component's chrome
-	 * (≈10 rows) so long content scrolls instead of pushing the submit
-	 * hint out of view.
+	 * (≈10 rows) and the title's detail rows so long content scrolls
+	 * instead of pushing the title or submit hint out of view.
 	 */
 	maxHeight?: number;
 }
@@ -73,9 +73,12 @@ export class HookEditorComponent extends OverlayPanel implements Focusable {
 			this.#editor.disableSubmit = true;
 		}
 		// Bound the editor so long content scrolls instead of pushing the
-		// submit hint off-screen. Caller may override via options.maxHeight.
+		// submit hint off-screen. The detail rows (plus their spacer) come out
+		// of the same budget so a long title cannot push the dialog past the
+		// terminal. Caller may override via options.maxHeight.
 		const termRows = this.#tui.terminal?.rows ?? process.stdout.rows ?? 40;
-		this.#editor.setMaxHeight(options?.maxHeight ?? Math.max(3, termRows - 12));
+		const detailRows = detailLines.length > 0 ? detailLines.length + 1 : 0;
+		this.#editor.setMaxHeight(options?.maxHeight ?? Math.max(3, termRows - 12 - detailRows));
 		this.#editor.setScrollbarVisible(true);
 		if (prefill) {
 			this.#editor.setText(prefill);

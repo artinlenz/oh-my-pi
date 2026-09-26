@@ -91,13 +91,20 @@ const DIALOG_HEIGHT_RATIO = 0.7;
 const MIN_DIALOG_ROWS = 12;
 const MIN_BODY_ROWS = 5;
 const MAX_HEADER_CHIP_WIDTH = 16;
-/** Maximum number of title lines shown in the prompt editor overlay, so a
- *  long or multi-line question cannot push the input row off-screen. Mirrors
- *  the bounded-title pattern from the legacy ask path without its option-window
- *  coupling. */
+/** Minimum number of title lines shown in the prompt editor overlay. The
+ *  real budget grows with the terminal height (see promptTitleRowBudget) so
+ *  the whole question stays visible whenever it fits, while a huge or
+ *  multi-line question still cannot push the input row off-screen. */
 const MAX_PROMPT_TITLE_ROWS = 3;
-/** Border (2) + padX (2) columns consumed by the HookEditor chrome. */
-const PROMPT_TITLE_CHROME_COLUMNS = 4;
+/** Columns the HookEditor chrome consumes around the first title line, which
+ *  it insets into the top border (`╭─ ` + title + ` ─╮`). Detail rows only
+ *  lose border (2) + padX (2), but wrapping every line at the narrower width
+ *  keeps the bordered line from being clipped. */
+const PROMPT_TITLE_CHROME_COLUMNS = 6;
+/** Rows the prompt-style HookEditor renders besides the title lines: spacer
+ *  above the detail rows, spacer, one editor row, spacer, hint, spacer, and
+ *  the bottom border. The first title line shares the top border. */
+const PROMPT_EDITOR_CHROME_ROWS = 7;
 /** Maximum number of wrapped lines for an in-body question header, so a long
  *  or multi-line question cannot push the option list off-screen. Mirrors the
  *  row-cap pattern used by boundPromptTitle for the prompt editor overlay. */
@@ -112,15 +119,25 @@ function promptTitleContentWidth(): number {
 	return Math.max(1, cols - PROMPT_TITLE_CHROME_COLUMNS);
 }
 
-/** Bound a prompt editor title to a fixed row/width budget so long or
- *  multi-line questions stay usable inside the small prompt overlay. */
+/** Title rows the prompt editor can show while staying within the same
+ *  terminal-height share as the ask dialog it replaces. */
+function promptTitleRowBudget(): number {
+	const termRows = process.stdout.rows || 40;
+	const available = Math.floor(termRows * DIALOG_HEIGHT_RATIO) - PROMPT_EDITOR_CHROME_ROWS;
+	return Math.max(MAX_PROMPT_TITLE_ROWS, available);
+}
+
+/** Bound a prompt editor title to the terminal's row/width budget so the
+ *  whole question shows when it fits and oversized questions stay usable
+ *  inside the prompt overlay. */
 export function boundPromptTitle(prefix: string, question: string): string {
 	const width = promptTitleContentWidth();
+	const maxRows = promptTitleRowBudget();
 	const flat = normalizedInlineInput(`${prefix}${question}`);
 	const wrapped = wrapTextWithAnsi(flat, width);
-	if (wrapped.length <= MAX_PROMPT_TITLE_ROWS) return wrapped.join("\n");
-	const kept = wrapped.slice(0, MAX_PROMPT_TITLE_ROWS - 1);
-	const last = truncateToWidth(wrapped[MAX_PROMPT_TITLE_ROWS - 1] ?? "", width, Ellipsis.Unicode);
+	if (wrapped.length <= maxRows) return wrapped.join("\n");
+	const kept = wrapped.slice(0, maxRows - 1);
+	const last = truncateToWidth(wrapped.slice(maxRows - 1).join(" "), width, Ellipsis.Unicode);
 	return [...kept, last].join("\n");
 }
 
@@ -155,6 +172,12 @@ interface QuestionState {
 	cursorIndex: number;
 	scrollOffset: number;
 	manualScroll: boolean;
+	/** PgUp (-1) / PgDn (+1) presses not yet applied; render applies them
+	 *  once the page size and option layout are known. */
+	pageRequest: number;
+	/** Last render scrolled the cursor option (partly) out of view. Enter,
+	 *  Space, and `n` then reveal it instead of acting on an unseen option. */
+	cursorHidden: boolean;
 	timedOut: boolean;
 }
 
@@ -485,7 +508,6 @@ export class AskDialogComponent implements Component {
 	#states: QuestionState[];
 	#activeTabIndex = 0;
 	#submitScrollOffset = 0;
-	#bodyRows = MIN_BODY_ROWS;
 	#questionCanPage = false;
 	#remainingSeconds: number | undefined;
 	#countdown: CountdownTimer | undefined;
@@ -500,6 +522,10 @@ export class AskDialogComponent implements Component {
 	#contentWidth = 76;
 	#headerExpandable = false;
 	#descExpandable = false;
+	/** Expanded question too tall for the header budget: rendered as leading
+	 *  lines of the scrollable body instead of being clipped in the header. */
+	#questionInBody = false;
+	#headerShown = false;
 	readonly #panel: OverlayPanel;
 	readonly #headerRegion: PanelRows;
 	readonly #bodyRegion: PanelRows;
@@ -523,6 +549,8 @@ export class AskDialogComponent implements Component {
 				cursorIndex: clamp(recommended ?? 0, 0, maxIndex),
 				scrollOffset: 0,
 				manualScroll: false,
+				pageRequest: 0,
+				cursorHidden: false,
 				timedOut: false,
 			};
 		});
@@ -541,11 +569,7 @@ export class AskDialogComponent implements Component {
 		this.#bodyRegion = new PanelRows();
 		this.#footerRegion = new PanelRows();
 		this.#footerRegion.setHeight(1);
-		this.#panel.addChild(this.#headerRegion);
-		this.#panel.addChild(new PanelDivider());
-		this.#panel.addChild(this.#bodyRegion);
-		this.#panel.addChild(new PanelDivider());
-		this.#panel.addChild(this.#footerRegion);
+		this.#layoutPanel(true);
 	}
 
 	invalidate(): void {
@@ -574,6 +598,15 @@ export class AskDialogComponent implements Component {
 		const descOverflows = questionDescriptionsOverflow(question, this.#contentWidth);
 		if (!headerOverflows && !descOverflows && !this.#expanded) return false;
 		this.#expanded = !this.#expanded;
+		if (this.#expanded) {
+			// Start at the top so an overflowing question that moved into the
+			// body is read from its first line; Up/Down re-anchor on the cursor.
+			for (const state of this.#states) {
+				state.scrollOffset = 0;
+				state.manualScroll = true;
+				state.pageRequest = 0;
+			}
+		}
 		this.invalidate();
 		this.#requestRender();
 		return true;
@@ -622,18 +655,21 @@ export class AskDialogComponent implements Component {
 		// re-measured only when the viewport changes. Tab switches, cursor
 		// moves, and later answers never resize the box; content that
 		// outgrows it scrolls. Expanding a truncated question uses the space
-		// available within the existing height cap.
+		// available within the existing height cap; a question taller than
+		// that moves into the scrollable body.
 		const totalRows = this.#dialogHeight(innerWidth, process.stdout.rows || 40);
 		const tabBarRows = this.#hasSubmitTab() ? 1 : 0;
 		const maxTitleRows = Math.max(1, totalRows - 5 - MIN_BODY_ROWS - tabBarRows);
 		const headerLines = this.#renderHeader(innerWidth, maxTitleRows);
+		const showHeader = headerLines.length > 0;
+		this.#layoutPanel(showHeader);
 		// top border (1) + header(N) + two dividers + footer(1) + bottom
 		// border (1) = N + 5 fixed rows outside the body. Without the bottom
 		// border term the dialog overflowed the viewport by one row
-		// (PRRT_kwDOQxs0bc6OFbDY).
-		const fixedRows = 1 + headerLines.length + 1 + 1 + 1 + 1;
+		// (PRRT_kwDOQxs0bc6OFbDY). An empty header drops its region and
+		// divider, leaving top border + divider + footer + bottom border.
+		const fixedRows = showHeader ? 1 + headerLines.length + 1 + 1 + 1 + 1 : 1 + 1 + 1 + 1;
 		const bodyRows = Math.max(MIN_BODY_ROWS, totalRows - fixedRows);
-		this.#bodyRows = bodyRows;
 		const bodyLines = this.#isSubmitTab()
 			? this.#renderSubmitBody(innerWidth, bodyRows)
 			: this.#renderQuestionBody(innerWidth, bodyRows);
@@ -644,6 +680,22 @@ export class AskDialogComponent implements Component {
 		this.#bodyRegion.setHeight(bodyRows);
 		this.#footerRegion.setLines([theme.fg("dim", footer)]);
 		return this.#panel.render(width);
+	}
+
+	/** Attach the header region and its divider only while it has rows, so a
+	 *  question moved into the body does not leave an empty rule under the
+	 *  title border. */
+	#layoutPanel(showHeader: boolean): void {
+		if (showHeader === this.#headerShown) return;
+		this.#headerShown = showHeader;
+		this.#panel.clear();
+		if (showHeader) {
+			this.#panel.addChild(this.#headerRegion);
+			this.#panel.addChild(new PanelDivider());
+		}
+		this.#panel.addChild(this.#bodyRegion);
+		this.#panel.addChild(new PanelDivider());
+		this.#panel.addChild(this.#footerRegion);
 	}
 
 	#dialogHeight(width: number, termRows: number): number {
@@ -728,6 +780,7 @@ export class AskDialogComponent implements Component {
 
 	#renderHeader(width: number, maxTitleRows: number): string[] {
 		const lines: string[] = [];
+		this.#questionInBody = false;
 		if (this.#hasSubmitTab()) {
 			const tabs: Tab[] = [
 				...this.#questions.map((question, index) => ({
@@ -756,8 +809,15 @@ export class AskDialogComponent implements Component {
 		const wrapped = wrapQuestionTitle(question, width);
 		this.#headerExpandable = wrapped.length > MAX_HEADER_ROWS;
 		this.#descExpandable = questionDescriptionsOverflow(question, width);
-		const maxRows = this.#expanded ? maxTitleRows : MAX_HEADER_ROWS;
-		lines.push(...renderQuestionTitle(question, width, maxRows));
+		if (!this.#expanded) {
+			lines.push(...renderQuestionTitle(question, width, MAX_HEADER_ROWS));
+			return lines;
+		}
+		// The header region does not scroll: an expanded question taller than
+		// its budget renders in the body (#renderQuestionList) where PgUp/PgDn
+		// reach every line.
+		this.#questionInBody = wrapped.length > maxTitleRows;
+		if (!this.#questionInBody) lines.push(...wrapped);
 		return lines;
 	}
 
@@ -812,13 +872,13 @@ export class AskDialogComponent implements Component {
 		const { question, state } = active;
 		const rows = this.#questionRows(question);
 		if (matchesSelectPageUp(keyData)) {
-			state.scrollOffset = Math.max(0, state.scrollOffset - Math.max(1, this.#bodyRows - 1));
+			state.pageRequest -= 1;
 			state.manualScroll = true;
 			this.#requestRender();
 			return;
 		}
 		if (matchesSelectPageDown(keyData)) {
-			state.scrollOffset += Math.max(1, this.#bodyRows - 1);
+			state.pageRequest += 1;
 			state.manualScroll = true;
 			this.#requestRender();
 			return;
@@ -826,25 +886,33 @@ export class AskDialogComponent implements Component {
 		if (matchesSelectUp(keyData)) {
 			state.cursorIndex = clamp(state.cursorIndex - 1, 0, Math.max(0, rows.length - 1));
 			state.manualScroll = false;
+			state.cursorHidden = false;
 			this.#requestRender();
 			return;
 		}
 		if (matchesSelectDown(keyData)) {
 			state.cursorIndex = clamp(state.cursorIndex + 1, 0, Math.max(0, rows.length - 1));
 			state.manualScroll = false;
+			state.cursorHidden = false;
 			this.#requestRender();
 			return;
 		}
 		const rowItem = rows[state.cursorIndex];
 		if (!rowItem) return;
-		if (keyData === "n" || keyData === "N") {
+		const isNote = keyData === "n" || keyData === "N";
+		const isEnter = matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n";
+		const isSpace = matchesKey(keyData, "space") || keyData === " ";
+		if (state.cursorHidden && (isNote || isEnter || (question.multi && isSpace))) {
+			state.manualScroll = false;
+			this.#requestRender();
+			return;
+		}
+		if (isNote) {
 			if (rowItem.kind === "option" || rowItem.kind === "other") {
 				void this.#promptForNote(question, state, rowItem);
 			}
 			return;
 		}
-		const isEnter = matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n";
-		const isSpace = matchesKey(keyData, "space") || keyData === " ";
 		if (!isEnter && !(question.multi && isSpace)) return;
 		if (rowItem.kind === "other") {
 			void this.#promptForCustomInput(question, state, rowItem);
@@ -983,8 +1051,11 @@ export class AskDialogComponent implements Component {
 		rows: number,
 	): RenderedList {
 		const mdTheme = getMarkdownTheme();
+		const questionInBody = this.#questionInBody;
 		const renderRows = (contentWidth: number): { allLines: string[]; lineStartByRow: number[] } => {
-			const allLines: string[] = [];
+			// An expanded question that outgrew the header leads the body, one
+			// blank row above the options, so it scrolls with them.
+			const allLines: string[] = questionInBody ? [...wrapQuestionTitle(question, contentWidth), ""] : [];
 			const lineStartByRow: number[] = [];
 			for (let index = 0; index < rowItems.length; index++) {
 				lineStartByRow.push(allLines.length);
@@ -1005,7 +1076,7 @@ export class AskDialogComponent implements Component {
 			}
 			return { allLines, lineStartByRow };
 		};
-		const layoutKey = `${width}:${rows}:${state.customInput === undefined ? 0 : 1}`;
+		const layoutKey = `${width}:${rows}:${state.customInput === undefined ? 0 : 1}:${questionInBody ? 1 : 0}`;
 		let overflowLayouts = this.#overflowLayouts.get(question);
 		const knownOverflow = overflowLayouts?.has(layoutKey) ?? false;
 		let renderedRows = renderRows(knownOverflow && width > 1 ? width - 1 : width);
@@ -1020,15 +1091,38 @@ export class AskDialogComponent implements Component {
 		const { allLines, lineStartByRow } = renderedRows;
 		const cursorStart = lineStartByRow[state.cursorIndex] ?? 0;
 		const cursorEnd = lineStartByRow[state.cursorIndex + 1] ?? allLines.length;
-		this.#questionCanPage = cursorEnd - cursorStart > rows;
-		state.scrollOffset = this.#scrollOffsetForCursor(
-			state.scrollOffset,
-			cursorStart,
-			cursorEnd,
-			rows,
-			allLines.length,
-			state.manualScroll,
-		);
+		// Paging covers an option taller than the viewport and, when present,
+		// the question lines above the options.
+		this.#questionCanPage = cursorEnd - cursorStart > rows || (questionInBody && allLines.length > rows);
+		const previousOffset = state.scrollOffset;
+		const pageDirection = Math.sign(state.pageRequest);
+		const pagedOffset = Math.max(0, previousOffset + state.pageRequest * Math.max(1, rows - 1));
+		state.pageRequest = 0;
+		state.scrollOffset =
+			questionInBody && state.manualScroll
+				? this.#questionPageOffset(
+						pagedOffset,
+						previousOffset,
+						pageDirection,
+						lineStartByRow[0] ?? allLines.length,
+						cursorStart,
+						cursorEnd,
+						rows,
+						allLines.length,
+					)
+				: this.#scrollOffsetForCursor(
+						pagedOffset,
+						cursorStart,
+						cursorEnd,
+						rows,
+						allLines.length,
+						state.manualScroll,
+					);
+		const viewEnd = state.scrollOffset + rows;
+		state.cursorHidden =
+			cursorEnd - cursorStart > rows
+				? state.scrollOffset < cursorStart || viewEnd > cursorEnd
+				: cursorStart < state.scrollOffset || cursorEnd > viewEnd;
 		const scrollView = new ScrollView(allLines, {
 			height: rows,
 			scrollbar: "auto",
@@ -1109,6 +1203,37 @@ export class AskDialogComponent implements Component {
 			nextOffset = cursorRows <= rows ? cursorEnd - rows : cursorStart;
 		}
 		return clamp(nextOffset, 0, maxOffset);
+	}
+
+	/**
+	 * Manual paging while the question leads the body. A page lands on a
+	 * question-only view or on the cursor option in full (the tall-option
+	 * rule when it exceeds the viewport). A mixed landing snaps in the paging
+	 * direction: up, or down from above it, to the last question-only page
+	 * so no question line is skipped; otherwise onto the cursor option. When
+	 * the question is shorter than the viewport that page is offset 0, which
+	 * may show leading options without a lower cursor option; `cursorHidden`
+	 * then keeps Enter from acting on the unseen row.
+	 */
+	#questionPageOffset(
+		offset: number,
+		previousOffset: number,
+		direction: number,
+		optionsStart: number,
+		cursorStart: number,
+		cursorEnd: number,
+		rows: number,
+		totalRows: number,
+	): number {
+		const maxOffset = Math.max(0, totalRows - rows);
+		const nextOffset = clamp(offset, 0, maxOffset);
+		const questionPage = Math.max(0, optionsStart - rows);
+		const cursorFits = cursorEnd - cursorStart <= rows;
+		const cursorLow = cursorFits ? cursorEnd - rows : cursorStart;
+		const cursorHigh = cursorFits ? cursorStart : cursorEnd - rows;
+		if (nextOffset <= questionPage || (nextOffset >= cursorLow && nextOffset <= cursorHigh)) return nextOffset;
+		if (direction < 0 || (direction > 0 && previousOffset < questionPage)) return questionPage;
+		return clamp(clamp(nextOffset, cursorLow, cursorHigh), 0, maxOffset);
 	}
 
 	#clipIndicator(offset: number, rows: number, totalRows: number): string {

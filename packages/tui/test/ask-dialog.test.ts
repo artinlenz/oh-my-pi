@@ -2,9 +2,10 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:
 import { stripVTControlCharacters } from "node:util";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { ExtensionAskDialogQuestion } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
-import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+import { AskDialogComponent, boundPromptTitle } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
-import { setKeybindings } from "@oh-my-pi/pi-tui";
+import { setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
 
 const DOWN = "\x1b[B";
 const UP = "\x1b[A";
@@ -22,6 +23,18 @@ function render(component: AskDialogComponent): string {
 	return stripVTControlCharacters(component.render(80).join("\n"));
 }
 
+const stdoutRestores: (() => void)[] = [];
+
+/** Pin a process.stdout dimension for the current test; afterEach restores it. */
+function setStdoutSize(key: "rows" | "columns", value: number): void {
+	const original = Object.getOwnPropertyDescriptor(process.stdout, key);
+	Object.defineProperty(process.stdout, key, { configurable: true, value });
+	stdoutRestores.push(() => {
+		if (original) Object.defineProperty(process.stdout, key, original);
+		else Reflect.deleteProperty(process.stdout, key);
+	});
+}
+
 describe("AskDialogComponent", () => {
 	beforeAll(async () => {
 		darkTheme = await getThemeByName("dark");
@@ -34,6 +47,7 @@ describe("AskDialogComponent", () => {
 	});
 
 	afterEach(() => {
+		for (let restore = stdoutRestores.pop(); restore; restore = stdoutRestores.pop()) restore();
 		setKeybindings(KeybindingsManager.inMemory());
 		vi.useRealTimers();
 		vi.restoreAllMocks();
@@ -983,6 +997,8 @@ describe("AskDialogComponent", () => {
 	});
 
 	it("bounds custom input prompt title for long multi-line questions", async () => {
+		// A short terminal leaves no room past the minimum title rows.
+		setStdoutSize("rows", 14);
 		const onPrompt = vi.fn().mockReturnValue(Promise.resolve("custom"));
 		const longQuestion = "This is a very long question ".repeat(20);
 		const questions: ExtensionAskDialogQuestion[] = [
@@ -1008,7 +1024,7 @@ describe("AskDialogComponent", () => {
 		expect(onPrompt).toHaveBeenCalledTimes(1);
 		const title = onPrompt.mock.calls[0][0] as string;
 		const lines = title.split("\n");
-		// Title must be bounded to at most MAX_PROMPT_TITLE_ROWS lines.
+		// Title must be bounded to the minimum MAX_PROMPT_TITLE_ROWS lines.
 		expect(lines.length).toBeLessThanOrEqual(3);
 		// Each line must fit within the terminal content width.
 		for (const line of lines) {
@@ -1019,6 +1035,7 @@ describe("AskDialogComponent", () => {
 	});
 
 	it("bounds note prompt title for long multi-line questions", async () => {
+		setStdoutSize("rows", 14);
 		const onPrompt = vi.fn().mockReturnValue(Promise.resolve("note"));
 		const longQuestion = "Multi\nline\nquestion ".repeat(30);
 		const questions: ExtensionAskDialogQuestion[] = [
@@ -1043,10 +1060,58 @@ describe("AskDialogComponent", () => {
 		expect(onPrompt).toHaveBeenCalledTimes(1);
 		const title = onPrompt.mock.calls[0][0] as string;
 		const lines = title.split("\n");
-		// Title must be bounded to at most MAX_PROMPT_TITLE_ROWS lines.
+		// Title must be bounded to the minimum MAX_PROMPT_TITLE_ROWS lines.
 		expect(lines.length).toBeLessThanOrEqual(3);
 		// The multi-line question must be flattened (no raw newlines expanding rows).
 		expect(stripVTControlCharacters(title)).toContain("Note for Option A:");
+	});
+
+	it("shows the whole question in the custom answer prompt when it fits the terminal", () => {
+		// Regression: the prompt title was capped at 3 rows, so a 150-word
+		// question lost most of its words behind the custom answer editor.
+		setStdoutSize("rows", 30);
+		setStdoutSize("columns", 80);
+		const tui = { requestRender: vi.fn(), terminal: { rows: 30, columns: 80 } } as unknown as TUI;
+		const renderPrompt = (question: string): string[] =>
+			new HookEditorComponent(tui, boundPromptTitle("Custom answer: ", question), undefined, vi.fn(), vi.fn(), {
+				promptStyle: true,
+			})
+				.render(80)
+				.map(line => stripVTControlCharacters(line));
+		const promptHeightCap = Math.floor(30 * 0.7);
+
+		// Short numbered tokens keep the question near typical prose length
+		// (~20 words per 74-column row) while every word stays identifiable.
+		const words = Array.from({ length: 150 }, (_, i) => `w${i}`);
+		const fitting = renderPrompt(words.join(" "));
+		const shown = new Set(fitting.join("\n").match(/\bw\d+\b/g));
+		expect(words.filter(word => !shown.has(word))).toEqual([]);
+		expect(fitting.length).toBeLessThanOrEqual(promptHeightCap);
+
+		const huge = renderPrompt(Array.from({ length: 2000 }, (_, i) => `w${i}`).join(" "));
+		expect(huge.length).toBeLessThanOrEqual(promptHeightCap);
+		expect(huge.join("\n")).toContain("…");
+		expect(huge.some(line => line.includes("> "))).toBe(true);
+	});
+
+	it("keeps the custom answer prompt within the terminal for a long question and multi-line draft", () => {
+		// Regression: the editor kept its terminal-height budget regardless of
+		// the title rows, so a long question plus a long draft rendered taller
+		// than the terminal and pushed the question off-screen.
+		setStdoutSize("rows", 40);
+		setStdoutSize("columns", 80);
+		const tui = { requestRender: vi.fn(), terminal: { rows: 40, columns: 80 } } as unknown as TUI;
+		const question = Array.from({ length: 400 }, (_, i) => `w${i}`).join(" ");
+		const title = boundPromptTitle("Custom answer: ", question);
+		const draft = Array.from({ length: 30 }, (_, i) => `draft line ${i}`).join("\n");
+		const lines = new HookEditorComponent(tui, title, draft, vi.fn(), vi.fn(), { promptStyle: true })
+			.render(80)
+			.map(line => stripVTControlCharacters(line));
+
+		expect(lines.length).toBeLessThanOrEqual(40);
+		expect(lines[0]).toContain("Custom answer: w0 ");
+		expect(lines.some(line => line.includes("draft line 29"))).toBe(true);
+		expect(lines.some(line => line.includes("enter or ctrl+q submit"))).toBe(true);
 	});
 
 	it("scrolls question rows when cursor moves below the viewport", () => {
@@ -1428,6 +1493,108 @@ describe("AskDialogComponent", () => {
 		const recollapsed = render(component);
 		expect(recollapsed.match(/This is a very long question/g)?.length ?? 0).toBe(collapsedCount);
 		expect(recollapsed).toContain("Ctrl+O expand");
+	});
+
+	it("pages through an expanded question taller than the dialog while options stay selectable", () => {
+		// Regression: the expanded header was clipped to the space left above
+		// the options, so most of a 400-word question stayed unreachable.
+		setStdoutSize("rows", 30);
+		const words = Array.from({ length: 400 }, (_, i) => `w${i}`);
+		const onSubmit = vi.fn();
+		const component = new AskDialogComponent(
+			[{ id: "q1", question: words.join(" "), options: [{ label: "Yes" }, { label: "No" }] }],
+			{ onSubmit, onCancel: vi.fn(), onPrompt: vi.fn() },
+		);
+		const heightCap = Math.floor(30 * 0.7);
+		const wordsShown = (output: string): Set<string> => new Set(output.match(/\bw\d+\b/g));
+
+		expect(wordsShown(render(component)).has("w399")).toBe(false);
+
+		component.handleInput("\x0f");
+		let output = render(component);
+		expect(wordsShown(output).has("w0")).toBe(true);
+		const seen = wordsShown(output);
+		for (let page = 0; page < 20; page++) {
+			component.handleInput(PAGE_DOWN);
+			output = render(component);
+			expect(component.render(80).length).toBeLessThanOrEqual(heightCap);
+			for (const word of wordsShown(output)) seen.add(word);
+		}
+		expect(words.filter(word => !seen.has(word))).toEqual([]);
+		expect(output).toContain("❯ ○ Yes");
+
+		component.handleInput(PAGE_UP);
+		component.handleInput(DOWN);
+		expect(render(component)).toContain("❯ ○ No");
+		component.handleInput(ENTER);
+		expect(onSubmit.mock.calls[0]?.[0].results[0].selectedOptions).toEqual(["No"]);
+	});
+
+	it("never pages other options into view without the cursor option of an in-body question", () => {
+		// Regression: paging a question that leads the body could land on a view
+		// showing earlier options while the cursor option, which Enter submits,
+		// sat just below it. At 30 rows the 380 five-column tokens wrap to 26
+		// body lines, so a page from the top lands exactly on such a mixed view.
+		setStdoutSize("rows", 30);
+		const words = Array.from({ length: 380 }, (_, i) => `w${String(i).padStart(3, "0")}`);
+		const labels = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"];
+		const component = new AskDialogComponent(
+			[{ id: "q1", question: words.join(" "), options: labels.map(label => ({ label })) }],
+			{ onSubmit: vi.fn(), onCancel: vi.fn(), onPrompt: vi.fn() },
+		);
+		component.handleInput("\x0f");
+		for (let i = 0; i < labels.length; i++) component.handleInput(DOWN);
+		const optionRow = /○ (Alpha|Bravo|Charlie|Delta|Echo|Foxtrot|Other)/;
+		const pages: string[] = [];
+		for (const key of [...Array(10).fill(PAGE_UP), ...Array(10).fill(PAGE_DOWN), ...Array(10).fill(PAGE_UP)]) {
+			component.handleInput(key);
+			pages.push(render(component));
+		}
+
+		for (const page of pages) {
+			if (optionRow.test(page)) expect(page).toContain("❯ ○ Other (type your own)");
+		}
+		const seen = new Set(pages.join("\n").match(/\bw\d{3}\b/g));
+		expect(words.filter(word => !seen.has(word))).toEqual([]);
+	});
+
+	it("reaches the top of a short in-body question and never submits an off-screen cursor option", () => {
+		// Regression: when the question moved into the body but stayed shorter
+		// than the viewport, paging snapped onto a low cursor option, so the
+		// question start was unreachable. At 40 rows 280 five-column tokens
+		// wrap to 19 lines: past the 18-row header budget, under the 24-row body.
+		setStdoutSize("rows", 40);
+		const words = Array.from({ length: 280 }, (_, i) => `w${String(i).padStart(3, "0")}`);
+		const onSubmit = vi.fn();
+		const component = new AskDialogComponent(
+			[
+				{
+					id: "q1",
+					question: words.join(" "),
+					options: Array.from({ length: 10 }, (_, i) => ({ label: `Opt${i}` })),
+					recommended: 9,
+				},
+			],
+			{ onSubmit, onCancel: vi.fn(), onPrompt: vi.fn() },
+		);
+		component.handleInput("\x0f");
+		const top = render(component);
+		expect(top).toContain("w000");
+		expect(top).not.toContain("❯");
+		const seen = new Set(top.match(/\bw\d{3}\b/g));
+		for (const key of [PAGE_DOWN, PAGE_UP, PAGE_UP]) {
+			component.handleInput(key);
+			for (const word of render(component).match(/\bw\d{3}\b/g) ?? []) seen.add(word);
+		}
+		expect(words.filter(word => !seen.has(word))).toEqual([]);
+
+		// Back at the top the cursor option is off-screen: Enter reveals it.
+		expect(render(component)).not.toContain("❯");
+		component.handleInput(ENTER);
+		expect(onSubmit).not.toHaveBeenCalled();
+		expect(render(component)).toContain("❯ ○ Opt9 (Recommended)");
+		component.handleInput(ENTER);
+		expect(onSubmit.mock.calls[0]?.[0].results[0].selectedOptions).toEqual(["Opt9"]);
 	});
 
 	it("does not consume expansion while the submit tab hides the question header", () => {
