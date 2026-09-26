@@ -992,6 +992,44 @@ describe("guest ask multi-select Next gating (#4375 PRRT_kwDOQxs0bc6OFbDW)", () 
 		}
 	});
 
+	it.each([
+		{ name: "offers chat by default", allowChat: undefined, multi: false, offered: true },
+		{
+			name: "omits chat from a single-select when allowChat is false",
+			allowChat: false,
+			multi: false,
+			offered: false,
+		},
+		{ name: "omits chat from a multi-select when allowChat is false", allowChat: false, multi: true, offered: false },
+	])("guest selector $name", async ({ allowChat, multi, offered }) => {
+		// `/tree` re-answer passes allowChat: false; a guest must not get a
+		// Chat about this choice the re-answer can only reject.
+		const ctx = makeAskHostContext();
+		const host = new CollabHost(ctx);
+		await host.start("ws://localhost:8787");
+		ctx.collabHost = host;
+		const controller = new ExtensionUiController(ctx);
+		try {
+			const guest = await joinRawGuest(host.link, COLLAB_PROTO);
+			const welcome = await guest.nextFrame();
+			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
+
+			const abort = new AbortController();
+			const result = controller.showAskDialog(
+				[{ id: "q1", question: "Pick?", options: [{ label: "Alpha" }], multi }],
+				{ signal: abort.signal, allowChat },
+			);
+			const first = await nextUiRequest(guest);
+			expect(selectLabels(first).includes("Chat about this")).toBe(offered);
+
+			abort.abort();
+			await result;
+			guest.socket.close();
+		} finally {
+			await host.stop("test done");
+		}
+	});
+
 	it("maps multi-select guest toggles back to original labels", async () => {
 		// Same display/identity split through the checkbox path: the guest
 		// toggles sanitized rows (checkedIndices round-trips against the

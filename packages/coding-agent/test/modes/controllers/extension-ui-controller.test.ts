@@ -1,11 +1,16 @@
 import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import { type Component, Container, isFocusable, type OverlayOptions, setKeybindings } from "@oh-my-pi/pi-tui";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
-import type { ExtensionAskDialogQuestion, ExtensionUIContext } from "../../../src/extensibility/extensions";
+import type {
+	ExtensionAskDialogQuestion,
+	ExtensionUIContext,
+	ExtensionUIDialogOptions,
+} from "../../../src/extensibility/extensions";
 import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { ExtensionUiController } from "../../../src/modes/controllers/extension-ui-controller";
+import { Settings } from "../../../src/config/settings";
 import { InputController } from "../../../src/modes/controllers/input-controller";
 import { getEditorTheme, getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../../../src/modes/types";
@@ -20,7 +25,7 @@ beforeAll(async () => {
 	setThemeInstance(dark);
 });
 
-function makeHarness() {
+function makeHarness(settingOverrides: Record<string, unknown> = {}) {
 	const editor = new CustomEditor(getEditorTheme());
 	const editorContainer = new Container();
 	editorContainer.addChild(editor);
@@ -51,6 +56,7 @@ function makeHarness() {
 			terminal: { rows: 40, columns: 120 },
 		},
 		editorContainer,
+		settings: Settings.isolated(settingOverrides),
 		session: {
 			extensionRunner: undefined,
 			setUsageFallbackConfirmer: vi.fn(),
@@ -243,6 +249,46 @@ describe("ExtensionUiController Ask dialog input", () => {
 			results: [{ id: "answer", selectedOptions: [], customInput: "typed after failure" }],
 		});
 		expect(harness.editor.getText()).toBe("");
+	});
+});
+
+describe("ExtensionUiController Ask chat option", () => {
+	const questions: ExtensionAskDialogQuestion[] = [
+		{ id: "answer", question: "Choose an answer?", options: [{ label: "Default" }] },
+	];
+
+	it.each<{
+		name: string;
+		settings: Record<string, unknown>;
+		dialogOptions?: ExtensionUIDialogOptions;
+		offered: boolean;
+	}>([
+		{ name: "hidden while ask.chatOption is off", settings: {}, offered: false },
+		{ name: "offered when ask.chatOption is on", settings: { "ask.chatOption": true }, offered: true },
+		{
+			name: "withheld by allowChat: false even when ask.chatOption is on",
+			settings: { "ask.chatOption": true },
+			dialogOptions: { allowChat: false },
+			offered: false,
+		},
+	])("Chat about this row is $name", ({ settings, dialogOptions, offered }) => {
+		const harness = makeHarness(settings);
+		void harness.controller.showAskDialog(questions, dialogOptions);
+		const ask = harness.editorContainer.children[0];
+		expect(ask).toBeInstanceOf(AskDialogComponent);
+		expect(ask!.render(120).join("\n").includes("Chat about this")).toBe(offered);
+	});
+
+	it("resolves a chat redirect when the host user picks Chat about this", async () => {
+		const harness = makeHarness({ "ask.chatOption": true });
+		const pending = harness.controller.showAskDialog(questions);
+		// Rows: Default, Other (type your own), Chat about this.
+		harness.handleInput("\x1b[B");
+		harness.handleInput("\x1b[B");
+		harness.handleInput("\r");
+
+		expect(await pending).toEqual({ kind: "chat" });
+		expect(harness.getFocused()).toBe(harness.editor);
 	});
 });
 

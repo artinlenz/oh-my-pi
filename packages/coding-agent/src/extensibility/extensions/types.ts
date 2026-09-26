@@ -197,6 +197,11 @@ export interface ExtensionUIDialogOptions {
 	 *  trailing options (e.g. "Other"/"Done" actions) keep the plain cursor.
 	 *  Defaults to all options when `selectionMarker` is set. */
 	markableCount?: number;
+	/** For ask dialogs: `false` withholds "Chat about this" from the host
+	 *  dialog (where `ask.chatOption` enables it) and from collab guests (who
+	 *  otherwise always get it), for callers with no agent turn to continue a
+	 *  chat redirect in (e.g. `/tree` re-answer). */
+	allowChat?: boolean;
 }
 
 /** Raw terminal input listener for extensions. */

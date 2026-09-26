@@ -35,6 +35,7 @@ import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../sessi
 import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
+import { cfgAskChatOption } from "../settings";
 
 const MAX_WIDGET_LINES = 10;
 const ASK_OTHER_OPTION = "Other (type your own)";
@@ -636,9 +637,12 @@ export class ExtensionUiController {
 		const localWinner = this.#showLocalAskDialog(normalized, { ...dialogOptions, signal: localSignal }).then(
 			(value): CollabAskDialogWinner => ({ source: "local", value }),
 		);
-		const remoteWinner: Promise<CollabAskDialogWinner> = this.#runGuestAskDialog(host, normalized, remoteSignal).then(
-			result => (result === "unavailable" ? localWinner : { source: "remote", value: result }),
-		);
+		const remoteWinner: Promise<CollabAskDialogWinner> = this.#runGuestAskDialog(
+			host,
+			normalized,
+			dialogOptions?.allowChat !== false,
+			remoteSignal,
+		).then(result => (result === "unavailable" ? localWinner : { source: "remote", value: result }));
 		const winner = await Promise.race([localWinner, remoteWinner]);
 		if (winner.source === "remote") localAbort.abort();
 		else remoteAbort.abort();
@@ -727,6 +731,7 @@ export class ExtensionUiController {
 					onTimeout: dialogOptions?.onTimeout,
 					tui: this.ctx.ui,
 					inputGuard,
+					chatOption: dialogOptions?.allowChat !== false && cfgAskChatOption.get(this.ctx.settings),
 				},
 			);
 			this.ctx.editorContainer.clear();
@@ -786,11 +791,12 @@ export class ExtensionUiController {
 	async #runGuestAskDialog(
 		host: CollabHost,
 		questions: ExtensionAskDialogQuestion[],
+		allowChat: boolean,
 		signal: AbortSignal,
 	): Promise<ExtensionAskDialogResult | "unavailable" | undefined> {
 		const results: ExtensionAskDialogResultItem[] = [];
 		for (const question of questions) {
-			const result = await this.#runGuestAskQuestion(host, question, signal);
+			const result = await this.#runGuestAskQuestion(host, question, allowChat, signal);
 			if (result === "unavailable" || result === undefined) return result;
 			if (result === "chat") return { kind: "chat" };
 			results.push(result);
@@ -801,6 +807,7 @@ export class ExtensionUiController {
 	async #runGuestAskQuestion(
 		host: CollabHost,
 		question: ExtensionAskDialogQuestion,
+		allowChat: boolean,
 		signal: AbortSignal,
 	): Promise<ExtensionAskDialogResultItem | "chat" | "unavailable" | undefined> {
 		const selected = new Set<string>();
@@ -840,7 +847,7 @@ export class ExtensionUiController {
 				const hasAnswer = selected.size > 0 || customInput !== undefined;
 				const options = [...baseOptions, ASK_OTHER_OPTION];
 				if (hasAnswer) options.push(ASK_NEXT_OPTION);
-				options.push(ASK_CHAT_OPTION);
+				if (allowChat) options.push(ASK_CHAT_OPTION);
 				const choice = await this.#requestGuestUiString(
 					host,
 					{
@@ -858,7 +865,7 @@ export class ExtensionUiController {
 				);
 				if (choice.kind === "unavailable") return "unavailable";
 				if (choice.kind === "cancelled") return undefined;
-				if (choice.value === ASK_CHAT_OPTION) return "chat";
+				if (allowChat && choice.value === ASK_CHAT_OPTION) return "chat";
 				if (choice.value === ASK_NEXT_OPTION) break;
 				if (choice.value === ASK_OTHER_OPTION) {
 					const input = await this.#requestGuestUiString(
@@ -889,7 +896,9 @@ export class ExtensionUiController {
 					{
 						kind: "select",
 						title: displayQuestion,
-						options: [...baseOptions, ASK_OTHER_OPTION, ASK_CHAT_OPTION],
+						options: allowChat
+							? [...baseOptions, ASK_OTHER_OPTION, ASK_CHAT_OPTION]
+							: [...baseOptions, ASK_OTHER_OPTION],
 						initialIndex,
 						selectionMarker: "radio",
 						markableCount: question.options.length,
@@ -899,7 +908,7 @@ export class ExtensionUiController {
 				);
 				if (choice.kind === "unavailable") return "unavailable";
 				if (choice.kind === "cancelled") return undefined;
-				if (choice.value === ASK_CHAT_OPTION) return "chat";
+				if (allowChat && choice.value === ASK_CHAT_OPTION) return "chat";
 				if (choice.value === ASK_OTHER_OPTION) {
 					const input = await this.#requestGuestUiString(
 						host,

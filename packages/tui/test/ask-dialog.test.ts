@@ -1844,4 +1844,98 @@ describe("AskDialogComponent", () => {
 		expect(rows).toHaveLength(2);
 		expect(rows[1]).toContain("Retry now (Recommended) (2)");
 	});
+
+	describe("chatOption", () => {
+		it("Enter on the chat row ends a single question with a chat redirect", () => {
+			const onSubmit = vi.fn();
+			const onPrompt = vi.fn();
+			const component = new AskDialogComponent(
+				[{ id: "q1", question: "Pick one?", options: [{ label: "Alpha" }, { label: "Beta" }] }],
+				{ onSubmit, onCancel: vi.fn(), onPrompt },
+				{ chatOption: true },
+			);
+
+			// Rows: Alpha, Beta, Other (type your own), Chat about this.
+			component.handleInput(DOWN);
+			component.handleInput(DOWN);
+			component.handleInput(DOWN);
+			component.handleInput(ENTER);
+
+			expect(onSubmit).toHaveBeenCalledTimes(1);
+			expect(onSubmit.mock.calls[0][0]).toEqual({ kind: "chat" });
+			expect(onPrompt).not.toHaveBeenCalled();
+		});
+
+		it("the question-tab chat row ignores Space and n, and Enter redirects the whole dialog", () => {
+			const onSubmit = vi.fn();
+			const onPrompt = vi.fn();
+			const component = new AskDialogComponent(
+				[
+					{ id: "q1", question: "Pick several?", options: [{ label: "Alpha" }], multi: true },
+					{ id: "q2", question: "Pick one?", options: [{ label: "Beta" }] },
+				],
+				{ onSubmit, onCancel: vi.fn(), onPrompt },
+				{ chatOption: true },
+			);
+
+			// Rows: Alpha, Other (type your own), Chat about this.
+			component.handleInput(DOWN);
+			component.handleInput(DOWN);
+			component.handleInput(SPACE);
+			component.handleInput("n");
+			expect(onPrompt).not.toHaveBeenCalled();
+			expect(onSubmit).not.toHaveBeenCalled();
+
+			component.handleInput(ENTER);
+			expect(onSubmit).toHaveBeenCalledTimes(1);
+			expect(onSubmit.mock.calls[0][0]).toEqual({ kind: "chat" });
+		});
+
+		it.each([
+			{ row: "Submit", keys: [], kind: "submit" },
+			{ row: "Chat about this", keys: [DOWN], kind: "chat" },
+		])("Enter on the Submit tab's $row row finishes with $kind", ({ keys, kind }) => {
+			const onSubmit = vi.fn();
+			const component = new AskDialogComponent(
+				[
+					{ id: "q1", question: "First?", options: [{ label: "A1" }] },
+					{ id: "q2", question: "Second?", options: [{ label: "A2" }] },
+				],
+				{ onSubmit, onCancel: vi.fn(), onPrompt: vi.fn() },
+				{ chatOption: true },
+			);
+
+			// Shift+Tab wraps from the first question to the Submit tab, which
+			// lists Submit (the default) and then Chat about this.
+			component.handleInput(SHIFT_TAB);
+			expect(render(component)).toContain("Chat about this");
+			for (const key of keys) component.handleInput(key);
+			component.handleInput(ENTER);
+
+			expect(onSubmit).toHaveBeenCalledTimes(1);
+			expect(onSubmit.mock.calls[0][0].kind).toBe(kind);
+		});
+
+		it("keeps an option colliding with the chat label distinct and answerable", () => {
+			const onSubmit = vi.fn();
+			const component = new AskDialogComponent(
+				[{ id: "q1", question: "Pick?", options: [{ label: "Chat\rabout this" }, { label: "Keep" }] }],
+				{ onSubmit, onCancel: vi.fn(), onPrompt: vi.fn() },
+				{ chatOption: true },
+			);
+
+			const rows = render(component)
+				.split("\n")
+				.filter(line => line.includes("Chat about this"));
+			expect(rows).toHaveLength(2);
+			expect(rows[0]).toContain("Chat about this (2)");
+
+			component.handleInput(ENTER);
+			expect(onSubmit).toHaveBeenCalledTimes(1);
+			expect(onSubmit.mock.calls[0][0]).toMatchObject({
+				kind: "submit",
+				results: [{ selectedOptions: ["Chat\rabout this"] }],
+			});
+		});
+	});
 });

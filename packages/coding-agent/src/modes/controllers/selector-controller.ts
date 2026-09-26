@@ -40,6 +40,7 @@ import {
 } from "../../extensibility/plugins/marketplace";
 import { getAvailableThemes, getSymbolTheme, previewTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
+import type { ExtensionUIContext } from "../../extensibility/extensions";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -1501,7 +1502,18 @@ export class SelectorController {
 			getPlanModeState: () => this.ctx.session.getPlanModeState(),
 		};
 		const askTool = new AskTool(toolSession);
-		const context = this.ctx.session.buildAskReanswerContext(uiContext);
+		// A chat redirect has no agent turn to continue here (see below), so
+		// withhold "Chat about this" from the host dialog and any collab guest
+		// rather than offer a choice that can only error.
+		const askDialog = uiContext.askDialog;
+		const reanswerUi: ExtensionUIContext = askDialog
+			? {
+					...uiContext,
+					askDialog: (reopened, dialogOptions) =>
+						askDialog.call(uiContext, reopened, { ...dialogOptions, allowChat: false }),
+				}
+			: uiContext;
+		const context = this.ctx.session.buildAskReanswerContext(reanswerUi);
 		let result: AgentToolResult<AskToolDetails>;
 		try {
 			result = await askTool.execute("tree-reanswer", { questions }, undefined, undefined, context);

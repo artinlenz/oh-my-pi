@@ -76,12 +76,14 @@ import { OverlayPanel, PanelDivider, PanelRows } from "../chrome/overlay-box";
 import { handleTabSwitchKey } from "../chrome/selector-helpers";
 
 const OTHER_OPTION = "Other (type your own)";
+const CHAT_OPTION = "Chat about this";
 const SUBMIT_OPTION = "Submit";
 
-// Action rows appended by the guest race participant. An option sanitizing
-// to one of these must disambiguate identically on both sides, or the same
-// question renders different rows depending on who answers.
-const GUEST_ACTION_LABELS = ["Chat about this", "Next →"];
+// Action rows appended by the guest race participant (the host adds the chat
+// row only with `chatOption`). An option sanitizing to one of these must
+// disambiguate identically on both sides, or the same question renders
+// different rows depending on who answers.
+const GUEST_ACTION_LABELS = [CHAT_OPTION, "Next →"];
 
 /** Fraction of the terminal the dialog may occupy. The box height is fixed
  *  at spawn from the tallest tab's content (re-measured only on viewport
@@ -125,7 +127,8 @@ export function boundPromptTitle(prefix: string, question: string): string {
 }
 
 interface AskDialogCallbacks {
-	onSubmit(result: ExtensionAskDialogSubmitResult): void;
+	/** Dialog completed: answers, or a chat redirect when `chatOption` is on. */
+	onSubmit(result: ExtensionAskDialogResult): void;
 	onCancel(): void;
 	onPrompt(title: string, prefill?: string): Promise<string | undefined>;
 }
@@ -145,6 +148,9 @@ interface AskDialogOptions {
 	onTimeout?: () => void;
 	tui?: TUI;
 	inputGuard?: AskDialogInputGuard;
+	/** Offer a "Chat about this" row on every question and on the Submit tab;
+	 *  choosing it finishes the dialog with `{ kind: "chat" }`. */
+	chatOption?: boolean;
 }
 
 interface QuestionState {
@@ -158,7 +164,8 @@ interface QuestionState {
 	timedOut: boolean;
 }
 
-type QuestionRowKind = "option" | "other";
+type QuestionRowKind = "option" | "other" | "chat";
+type SubmitRowKind = "submit" | "chat";
 
 interface QuestionRow {
 	kind: QuestionRowKind;
@@ -398,7 +405,11 @@ function renderRowLabel(
 	const checked =
 		option !== undefined ? state.selectedOptions.has(option.label) : isOther && state.customInput !== undefined;
 	const color = selected ? "accent" : checked ? "toolOutput" : "text";
-	const marker = `${theme.fg(checked ? "success" : "dim", optionMarker(theme, question.multi, checked))} `;
+	const glyph = optionMarker(theme, question.multi, checked);
+	// The chat row is an action, not an answer: no radio/checkbox, but keep
+	// its label aligned with the answer rows.
+	const marker =
+		rowItem.kind === "chat" ? padding(visibleWidth(glyph) + 1) : `${theme.fg(checked ? "success" : "dim", glyph)} `;
 	const cursor = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 	const label = renderInlineMarkdown(rowItem.label, mdTheme, t => theme.fg(color, t));
 	const noteMarker = state.note && state.noteRowKey === rowItem.key ? theme.fg("success", "  ✎ note") : "";
@@ -485,6 +496,9 @@ export class AskDialogComponent implements Component {
 	#states: QuestionState[];
 	#activeTabIndex = 0;
 	#submitScrollOffset = 0;
+	#submitCursorIndex = 0;
+	/** Bottom scroll offset of the Submit tab body as last rendered. */
+	#submitMaxScroll = 0;
 	#bodyRows = MIN_BODY_ROWS;
 	#questionCanPage = false;
 	#remainingSeconds: number | undefined;
@@ -692,8 +706,8 @@ export class AskDialogComponent implements Component {
 		}
 		if (this.#hasSubmitTab()) {
 			// Warning line + blank, one summary line per question, blank, and
-			// the Submit row; note lines added later scroll within the body.
-			const body = 2 + this.#questions.length + 2;
+			// the action rows; note lines added later scroll within the body.
+			const body = 2 + this.#questions.length + 1 + this.#submitRows().length;
 			needed = Math.max(needed, chrome + tabBarRows + 1 + Math.max(MIN_BODY_ROWS, body));
 		}
 		return Math.min(needed, maxHeight);
@@ -772,7 +786,8 @@ export class AskDialogComponent implements Component {
 		if (inputGuard?.isBlocked()) return `${inputGuard.hint}${this.#expandHint()} · ${cancel}`;
 		if (this.#isSubmitTab()) {
 			const scroll = indicator ? ` ${indicator} scroll ·` : "";
-			return `Enter submit · ↑/↓ scroll ·${scroll} ${cancel}`;
+			const keys = this.options.chatOption ? "Enter select · ↑/↓ move" : "Enter submit · ↑/↓ scroll";
+			return `${keys} ·${scroll} ${cancel}`;
 		}
 		const question = this.#questions[this.#currentQuestionIndex()];
 		// Enter advances in multi-question dialogs and submits single-question ones.
@@ -796,7 +811,14 @@ export class AskDialogComponent implements Component {
 			optionIndex: index,
 		}));
 		rows.push({ kind: "other", key: "other", label: OTHER_OPTION, optionIndex: undefined });
+		if (this.options.chatOption) {
+			rows.push({ kind: "chat", key: "chat", label: CHAT_OPTION, optionIndex: undefined });
+		}
 		return rows;
+	}
+
+	#submitRows(): SubmitRowKind[] {
+		return this.options.chatOption ? ["submit", "chat"] : ["submit"];
 	}
 
 	#activeQuestionState(): { question: ExtensionAskDialogQuestion; state: QuestionState } | undefined {
@@ -846,6 +868,10 @@ export class AskDialogComponent implements Component {
 		const isEnter = matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n";
 		const isSpace = matchesKey(keyData, "space") || keyData === " ";
 		if (!isEnter && !(question.multi && isSpace)) return;
+		if (rowItem.kind === "chat") {
+			if (isEnter) this.#finishChat();
+			return;
+		}
 		if (rowItem.kind === "other") {
 			void this.#promptForCustomInput(question, state, rowItem);
 			return;
@@ -877,25 +903,42 @@ export class AskDialogComponent implements Component {
 	}
 
 	#handleSubmitTabInput(keyData: string): void {
+		const rows = this.#submitRows();
+		// ↑/↓ move between the action rows and scroll the review past them.
+		// The action rows end the body, so revealing the cursor means scrolling
+		// to the bottom (as last rendered, so later ↑ presses in the same burst
+		// still scroll up); offsets are clamped again in #renderSubmitBody.
 		if (matchesSelectUp(keyData)) {
-			this.#submitScrollOffset = Math.max(0, this.#submitScrollOffset - 1);
+			if (this.#submitCursorIndex > 0) {
+				this.#submitCursorIndex -= 1;
+				this.#submitScrollOffset = this.#submitMaxScroll;
+			} else {
+				this.#submitScrollOffset = Math.max(0, this.#submitScrollOffset - 1);
+			}
 			this.#requestRender();
 			return;
 		}
 		if (matchesSelectDown(keyData)) {
-			// Clamped against the rendered line count in #renderSubmitBody.
-			this.#submitScrollOffset += 1;
+			if (this.#submitCursorIndex < rows.length - 1) {
+				this.#submitCursorIndex += 1;
+				this.#submitScrollOffset = this.#submitMaxScroll;
+			} else {
+				this.#submitScrollOffset += 1;
+			}
 			this.#requestRender();
 			return;
 		}
 		const isEnter = matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n";
-		if (isEnter) this.#finishSubmit();
+		if (!isEnter) return;
+		if (rows[this.#submitCursorIndex] === "chat") this.#finishChat();
+		else this.#finishSubmit();
 	}
 
 	#switchTab(direction: 1 | -1): void {
 		const tabCount = this.#questions.length + 1;
 		this.#activeTabIndex = (this.#activeTabIndex + direction + tabCount) % tabCount;
 		this.#submitScrollOffset = 0;
+		this.#submitCursorIndex = 0;
 	}
 
 	#advanceAfterQuestion(): void {
@@ -906,6 +949,7 @@ export class AskDialogComponent implements Component {
 		}
 		this.#activeTabIndex = current + 1 < this.#questions.length ? current + 1 : this.#submitTabIndex();
 		this.#submitScrollOffset = 0;
+		this.#submitCursorIndex = 0;
 		this.#requestRender();
 	}
 
@@ -935,6 +979,7 @@ export class AskDialogComponent implements Component {
 			if (question.multi && this.#questions.length === 1) {
 				this.#activeTabIndex = this.#submitTabIndex();
 				this.#submitScrollOffset = 0;
+				this.#submitCursorIndex = 0;
 			} else {
 				this.#advanceAfterQuestion();
 			}
@@ -1072,8 +1117,14 @@ export class AskDialogComponent implements Component {
 			}
 		}
 		allLines.push("");
-		allLines.push(theme.fg("accent", `${theme.nav.cursor} ${SUBMIT_OPTION}`));
-		this.#submitScrollOffset = clamp(this.#submitScrollOffset, 0, Math.max(0, allLines.length - rows));
+		const submitRows = this.#submitRows();
+		for (let index = 0; index < submitRows.length; index++) {
+			const selected = index === this.#submitCursorIndex;
+			const label = submitRows[index] === "chat" ? CHAT_OPTION : SUBMIT_OPTION;
+			allLines.push(theme.fg(selected ? "accent" : "text", `${selected ? `${theme.nav.cursor} ` : "  "}${label}`));
+		}
+		this.#submitMaxScroll = Math.max(0, allLines.length - rows);
+		this.#submitScrollOffset = clamp(this.#submitScrollOffset, 0, this.#submitMaxScroll);
 		const scrollView = new ScrollView(allLines, {
 			height: rows,
 			scrollbar: "auto",
@@ -1175,6 +1226,13 @@ export class AskDialogComponent implements Component {
 		this.#closed = true;
 		this.#countdown?.dispose();
 		this.callbacks.onCancel();
+	}
+
+	#finishChat(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#countdown?.dispose();
+		this.callbacks.onSubmit({ kind: "chat" });
 	}
 
 	#buildResults(): ExtensionAskDialogResultItem[] {

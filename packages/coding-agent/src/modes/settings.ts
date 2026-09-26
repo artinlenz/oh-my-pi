@@ -1120,6 +1120,18 @@ export const cfgAskNotify = register({
 	},
 });
 
+export const cfgAskChatOption = register({
+	id: "ask.chatOption",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "interaction",
+		group: "Notifications",
+		label: "Ask Chat Option",
+		description: 'Show a "Chat about this" choice in ask dialogs to discuss a question instead of answering it',
+	},
+});
+
 export const cfgRecapEnabled = register({
 	id: "recap.enabled",
 	type: "boolean",

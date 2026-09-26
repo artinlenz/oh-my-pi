@@ -8,9 +8,14 @@
  * ask toolResults).
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
+import { Container } from "@oh-my-pi/pi-tui";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
-import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { getEditorTheme, initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { SessionEntry, SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
@@ -79,7 +84,16 @@ function createEditorSlot(): EditorSlot {
 	};
 }
 
-function createCtx(leafEntry: SessionEntry, navigateTreeResult: unknown = { cancelled: false }) {
+interface ReanswerOverrides {
+	settings?: Settings;
+	getToolUIContext?: () => ExtensionUIContext | undefined;
+}
+
+function createCtx(
+	leafEntry: SessionEntry,
+	navigateTreeResult: unknown = { cancelled: false },
+	overrides: ReanswerOverrides = {},
+) {
 	const tree: SessionTreeNode[] = [{ entry: leafEntry, children: [] }];
 	const navigateTree = vi.fn(async () => navigateTreeResult as never);
 	const showStatus = vi.fn();
@@ -105,8 +119,15 @@ function createCtx(leafEntry: SessionEntry, navigateTreeResult: unknown = { canc
 			getTree: () => tree,
 			getLeafId: () => leafEntry.id,
 			getEntry: (id: string) => (id === leafEntry.id ? leafEntry : undefined),
+			getCwd: () => "/tmp",
+			getSessionFile: () => undefined,
 		},
-		session: { navigateTree, resumeAfterAskReanswer },
+		session: {
+			navigateTree,
+			resumeAfterAskReanswer,
+			getPlanModeState: () => undefined,
+			buildAskReanswerContext: (ui: ExtensionUIContext) => ({ ui, hasUI: true, abort: vi.fn() }),
+		},
 		ui: {
 			setFocus: vi.fn(),
 			getFocused: () => undefined,
@@ -124,6 +145,7 @@ function createCtx(leafEntry: SessionEntry, navigateTreeResult: unknown = { canc
 		// `allowAskReopen: true` at all, not exercising the re-answer dialog
 		// itself (already covered at the session level).
 		getToolUIContext: () => undefined,
+		...overrides,
 	} as unknown as InteractiveModeContext;
 	return { ctx, editorContainer, navigateTree, showStatus, showError, resumeAfterAskReanswer, order };
 }
@@ -207,5 +229,53 @@ describe("SelectorController.showTreeSelector re-answering the active ask leaf",
 		await pickEntry(editorContainer, "some-other-entry");
 
 		expect(resumeAfterAskReanswer).not.toHaveBeenCalled();
+	});
+
+	it("re-opens the ask dialog without Chat about this even when ask.chatOption is on", async () => {
+		// A chat redirect has no turn to continue in a standalone re-answer, so
+		// the host dialog must not offer a choice that can only error.
+		const settings = Settings.isolated({ "ask.chatOption": true, "ask.notify": "off" });
+		// The host focuses the dialog once it is mounted.
+		const mounted = Promise.withResolvers<AskDialogComponent>();
+		const host = new ExtensionUiController({
+			settings,
+			editor: new CustomEditor(getEditorTheme()),
+			editorContainer: new Container(),
+			ui: {
+				requestRender: vi.fn(),
+				setFocus: (component: unknown) => {
+					if (component instanceof AskDialogComponent) mounted.resolve(component);
+				},
+				terminal: { rows: 40, columns: 120 },
+			},
+		} as unknown as InteractiveModeContext);
+		const uiContext = {
+			askDialog: (questions, dialogOptions) => host.showAskDialog(questions, dialogOptions),
+		} as Partial<ExtensionUIContext> as ExtensionUIContext;
+		const entry = askResultEntry("leaf-ask");
+		const reopenQuestions = [
+			{
+				id: "deploy_target",
+				question: "Which deploy target?",
+				options: [{ label: "staging" }, { label: "production" }],
+			},
+		];
+		const { ctx, editorContainer, showStatus } = createCtx(
+			entry,
+			{ reopenAsk: { questions: reopenQuestions } },
+			{ settings, getToolUIContext: () => uiContext },
+		);
+		const controller = new SelectorController(ctx);
+
+		controller.showTreeSelector();
+		const picked = pickEntry(editorContainer, "leaf-ask");
+		const ask = await mounted.promise;
+		const rendered = ask.render(120).join("\n");
+		expect(rendered).toContain("Which deploy target?");
+		expect(rendered).not.toContain("Chat about this");
+
+		ask.handleInput("\x1b");
+		await picked;
+		expect(showStatus).toHaveBeenCalledWith("Re-answer cancelled");
 	});
 });

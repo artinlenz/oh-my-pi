@@ -6,7 +6,7 @@
 - Entry: `packages/coding-agent/src/tools/ask.ts`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/ask.md`
 - Key collaborators:
-  - `packages/coding-agent/src/modes/settings.ts` — `ask.timeout` / `ask.notify` defaults
+  - `packages/coding-agent/src/modes/settings.ts` — `ask.timeout` / `ask.notify` / `ask.chatOption` defaults
   - `packages/tui/src/theme/theme.ts` — checkbox and radio glyphs for TUI rendering
   - `packages/tui/src/render/index.ts` — status-line rendering
 
@@ -44,7 +44,7 @@
 2. `execute()` also requires `context.hasUI` and `context.ui`; if missing it aborts the context and throws `ToolAbortError("Ask tool requires interactive mode")`.
 3. It reads `ask.timeout` from settings, converts seconds to milliseconds (`0` disables timeout), and disables timeout entirely while plan mode is enabled.
 4. If `ask.notify` is not `off`, it sends a terminal notification: `Waiting for input`. When `speech.enabled` is true, it also sends all question text to the vocalizer before opening the dialog.
-5. When the UI supplies `askDialog`, the tool opens one rich multi-question form. Rich options receive `header`, `description`, and `preview`; results may contain an answer note or choose the dialog's `Chat about this` redirect.
+5. When the UI supplies `askDialog`, the tool opens one rich multi-question form. Rich options receive `header`, `description`, and `preview`; results may contain an answer note or choose the dialog's `Chat about this` redirect. The interactive TUI offers that row only when `ask.chatOption` is `true` (default `false`); a collab guest answering the same ask gets it regardless of the setting.
 6. Otherwise it uses the selector/editor fallback for each question:
    - single-select list plus `Other (type your own)`
    - multi-select checkbox loop plus `Done selecting` when applicable and `Other (type your own)`
@@ -58,7 +58,7 @@
 - Multiple questions: returns `details.results[]`; the fallback permits arrow-key back/forward navigation, while a rich UI presents the complete form.
 - Single-select: one option or custom input.
 - Multi-select: toggled choices or custom input. In the fallback, `Done selecting` appears only when forward navigation is not active and at least one choice is selected.
-- Rich ask dialog: supports per-question headers, option previews, answer notes, and a `Chat about this` redirect. Submitting a nonempty custom answer advances to the next question, or to review for a single multi-select question; existing checkbox selections are preserved. A single-select question still submits immediately when it is the only question.
+- Rich ask dialog: supports per-question headers, option previews, answer notes, and a `Chat about this` redirect. With `ask.chatOption` enabled, `Chat about this` follows `Other (type your own)` on every question and follows `Submit` on the review tab; Enter on it returns the chat redirect instead of answers. `/tree` re-answer omits it for both the host and collab guests, since it has no turn to continue the chat in. Submitting a nonempty custom answer advances to the next question, or to review for a single multi-select question; existing checkbox selections are preserved. A single-select question still submits immediately when it is the only question.
 - Custom editor: paste followed by Enter submits the pasted text, including when they arrive together. Submission waits for an in-flight clipboard read; cancellation discards pending clipboard delivery.
 - Selector/editor fallback: supports labels/descriptions but not headers, previews, notes, or chat redirect.
 

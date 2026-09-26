@@ -35,7 +35,7 @@ import {
 } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolAbortError } from "./tool-errors";
 
-import { cfgAskNotify, cfgAskTimeout } from "../modes/settings";
+import { cfgAskChatOption, cfgAskNotify, cfgAskTimeout } from "../modes/settings";
 import { cfgSpeechEnabled } from "../tts/settings";
 
 // =============================================================================
@@ -751,7 +751,9 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	readonly approval = "read" as const;
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
-	readonly description: string;
+	get description(): string {
+		return prompt.render(askDescription, { chatOption: cfgAskChatOption.get(this.session.settings) });
+	}
 	readonly parameters = askSchema;
 	readonly strict = true;
 
@@ -778,9 +780,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	readonly concurrency = "exclusive";
 	readonly loadMode = "discoverable";
 
-	constructor(private readonly session: ToolSession) {
-		this.description = prompt.render(askDescription);
-	}
+	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): AskTool | null {
 		return (session.canPromptUser ?? session.hasUI) ? new AskTool(session) : null;
