@@ -21,6 +21,7 @@ import type {
 	EditorTheme,
 	LoaderMessageColorFn,
 	OverlayHandle,
+	SgrMouseEvent,
 	SlashCommand,
 } from "@oh-my-pi/pi-tui";
 import {
@@ -1287,6 +1288,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	resolveViewportClickCandidates(index: number): string[] {
 		return this.composer.viewportClickCandidates(index);
+	}
+
+	routeViewportMouse(event: SgrMouseEvent, index: number): boolean {
+		return this.composer.routeViewportMouse(event, index);
 	}
 
 	/** Flip the pinned jump list between its collapsed few and the full list, overriding the setting. */

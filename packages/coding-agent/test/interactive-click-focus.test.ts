@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -9,6 +9,7 @@ import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mod
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task";
@@ -54,10 +55,12 @@ describe("inline click-to-focus geometry", () => {
 		mode = new InteractiveMode(session, "test", undefined, () => {}, undefined, undefined, eventBus, composer);
 	});
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		mode?.stop();
 		await session?.dispose();
 		authStorage?.close();
 		tempDir?.removeSync();
+		AgentRegistry.resetGlobalForTests();
 		resetSettingsForTest();
 	});
 
@@ -265,5 +268,85 @@ describe("inline click-to-focus geometry", () => {
 		await clickRow("show less");
 		await term.waitForRender(() => plainRows(term.getViewport()).some(row => row.includes("more — expand")));
 		expect(plainRows(term.getViewport()).some(row => row.includes("ToggleAgent3"))).toBe(false);
+	});
+
+	it("places the prompt cursor on an SGR click while card clicks still focus the agent", async () => {
+		cfgTuiMouse.set(settings, true);
+		await mode.init({ suppressWelcomeIntro: true });
+		void mode.getUserInput();
+		await term.waitForRender();
+
+		const card = new ToolExecutionComponent(
+			"task",
+			{},
+			{},
+			undefined,
+			{
+				requestRender: () => mode.ui.requestRender(),
+				requestComponentRender: () => {},
+				resetDisplay: () => {},
+			},
+			tempDir.path(),
+		);
+		mode.chatContainer.addChild(card);
+		card.updateResult(
+			{
+				content: [{ type: "text", text: "Running 1 agent..." }],
+				details: {
+					projectAgentsDir: null,
+					results: [],
+					totalDurationMs: 1,
+					progress: [
+						{
+							index: 0,
+							id: "CardWorker",
+							agent: "task",
+							agentSource: "bundled",
+							status: "running",
+							task: "card work",
+							recentTools: [],
+							recentOutput: [],
+							toolCount: 1,
+							requests: 1,
+							tokens: 0,
+							cost: 0,
+							durationMs: 0,
+						},
+					],
+				},
+			},
+			true,
+		);
+		AgentRegistry.global().register({
+			id: "CardWorker",
+			displayName: "card worker",
+			kind: "sub",
+			session: {} as unknown as AgentSession,
+			sessionFile: null,
+		});
+		const focusAgent = vi.spyOn(mode, "focusAgentSession").mockResolvedValue(undefined);
+
+		term.sendInput("alpha beta gamma");
+		await term.waitForRender(() => plainRows(term.getViewport()).some(row => row.includes("alpha beta gamma")));
+		mode.ui.requestRender();
+		await term.waitForRender();
+
+		// Press + release on the first cell of "beta", then type: the text lands there.
+		const viewport = plainRows(term.getViewport());
+		const editorRow = viewport.findIndex(row => row.includes("alpha beta gamma"));
+		const betaCol = viewport[editorRow]!.indexOf("beta") + 1;
+		term.sendInput(`\x1b[<0;${betaCol};${editorRow + 1}M`);
+		term.sendInput(`\x1b[<0;${betaCol};${editorRow + 1}m`);
+		term.sendInput("X");
+		await term.waitForRender(() => plainRows(term.getViewport()).some(row => row.includes("alpha Xbeta gamma")));
+		expect(mode.editor.getText()).toBe("alpha Xbeta gamma");
+		expect(focusAgent).not.toHaveBeenCalled();
+
+		// A click on the live card still focuses its agent and leaves the draft alone.
+		const cardRow = plainRows(term.getViewport()).findIndex(row => row.includes("CardWorker"));
+		expect(cardRow).toBeGreaterThanOrEqual(0);
+		term.sendInput(`\x1b[<0;5;${cardRow + 1}M`);
+		expect(focusAgent).toHaveBeenCalledWith("CardWorker");
+		expect(mode.editor.getText()).toBe("alpha Xbeta gamma");
 	});
 });

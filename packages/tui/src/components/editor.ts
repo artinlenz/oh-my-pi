@@ -13,6 +13,7 @@ import { BracketedPasteHandler, decodeReencodedPasteControls } from "../brackete
 import { canonicalKeyId, getKeybindings, type KeybindingsManager } from "../keybindings";
 import { extractPrintableText, matchesKey, parseKey } from "../keys";
 import { KillRing } from "../kill-ring";
+import type { MouseRoutable, SgrMouseEvent } from "../mouse";
 import type { SymbolTheme } from "../symbols";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
 import {
@@ -513,7 +514,7 @@ export interface PasteOptions {
 	submitAfterPaste?: boolean;
 }
 
-export class Editor implements Component, Focusable {
+export class Editor implements Component, Focusable, MouseRoutable {
 	#state: EditorState = {
 		lines: [""],
 		cursorLine: 0,
@@ -551,6 +552,15 @@ export class Editor implements Component, Focusable {
 	 *  overflows {@link #maxHeight}. Enabled by {@link HookEditorComponent} and
 	 *  other multi-line consumers; single-line consumers are unaffected. */
 	#scrollbarVisible = false;
+
+	// Hit-test geometry of the last render for click-to-place (`routeMouse`):
+	// the rendered row of each visible layout line, the side-chrome width,
+	// the text origin (side chrome + prompt gutter), and the first right-chrome
+	// column. Rows and columns outside these are chrome.
+	#hitRowStarts: number[] = [];
+	#hitSideChrome = 0;
+	#hitTextCol = 0;
+	#hitChromeEnd = 0;
 
 	// Emacs-style kill ring
 	#killRing = new KillRing();
@@ -1218,6 +1228,10 @@ export class Editor implements Component, Focusable {
 
 		const box = this.#theme.symbols.boxRound;
 		const borderWidth = this.#getHorizontalChromeWidth(paddingX);
+		this.#hitSideChrome = borderWidth;
+		this.#hitTextCol = borderWidth + (promptGutter?.width ?? 0);
+		this.#hitChromeEnd = width - borderWidth;
+		this.#hitRowStarts.length = 0;
 
 		// Layout the text
 		const layoutLines = this.#layoutText(layoutWidth);
@@ -1274,6 +1288,7 @@ export class Editor implements Component, Focusable {
 		const vimSelection = this.#vimSelection();
 
 		for (let visibleIndex = 0; visibleIndex < visibleLayoutLines.length; visibleIndex++) {
+			this.#hitRowStarts.push(result.length);
 			const layoutLine = visibleLayoutLines[visibleIndex]!;
 			let displayText = layoutLine.text;
 			let displayWidth = layoutLine.width;
@@ -2518,6 +2533,53 @@ export class Editor implements Component, Focusable {
 
 	moveToMessageEnd(): void {
 		this.#moveToMessageEnd();
+	}
+
+	/**
+	 * Click-to-place: a left click on a text row moves the cursor to the
+	 * grapheme boundary under the pointer, resolved against the last rendered
+	 * frame (scroll offset and soft wraps included). A click past a row's end
+	 * lands at that row's end; the side chrome (border, padding, scrollbar),
+	 * the top/bottom chrome rows and the autocomplete rows are inert.
+	 */
+	routeMouse(event: SgrMouseEvent, line: number, col: number): void {
+		// Focus is re-checked here, not only when the host recorded the span: a
+		// dialog can take focus between frames. A live dictation preview is
+		// anchored at the cursor; moving away would make its next replacement
+		// delete the wrong text.
+		if (!event.leftClick || !this.focused || this.#volatileTextLen > 0) return;
+		if (col < this.#hitSideChrome || col >= this.#hitChromeEnd) return;
+		const visibleIndex = this.#hitRowStarts.indexOf(line);
+		if (visibleIndex < 0) return;
+		const visualLines = this.#buildVisualLineMap(this.#lastLayoutWidth);
+		const index = this.#scrollOffset + visibleIndex;
+		const target = visualLines[index];
+		if (!target) return;
+		const lineText = this.#state.lines[target.logicalLine] ?? "";
+		const segment = lineText.slice(target.startCol, target.startCol + target.length);
+		const isLastSegment = visualLines[index + 1]?.logicalLine !== target.logicalLine;
+		const visualCol = Math.min(Math.max(0, col - this.#hitTextCol), maxSegmentVisualCol(segment, isLastSegment));
+		let cursorCol = target.startCol + offsetAtVisualCol(segment, visualCol);
+		// Never park inside an atomic placeholder: snap to its nearer edge.
+		const token = this.#atomicTokenAt(lineText, cursorCol);
+		if (token !== undefined && token.start < cursorCol) {
+			cursorCol = cursorCol - token.start <= token.end - cursorCol ? token.start : token.end;
+		}
+		this.#jumpMode = null;
+		// An explicit placement is an edit position: leave history browsing so
+		// typing at a clicked line start is not redirected to the end.
+		this.#historyIndex = -1;
+		this.#resetKillSequence();
+		if (this.#autocompleteState) {
+			this.#cancelAutocomplete();
+			this.onAutocompleteUpdate?.();
+		}
+		const selectedLinesBefore = this.vimSelectedLines;
+		this.#state.cursorLine = target.logicalLine;
+		this.#setCursorCol(cursorCol);
+		this.#clampVimCursor();
+		// A Visual selection's moving end followed the click: hosts show its line count.
+		if (this.vimSelectedLines !== selectedLinesBefore) this.onVimModeChange?.(this.vimMode);
 	}
 
 	/** The `tui.editor.deleteCharForward` operation, callable by hosts that resolve the chord

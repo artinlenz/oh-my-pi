@@ -6,6 +6,7 @@ import {
 	matchesKey,
 	parseSgrMouse,
 	type PasteOptions,
+	type SgrMouseEvent,
 	type SlashCommand,
 } from "@oh-my-pi/pi-tui";
 import { isEnoent, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
@@ -759,11 +760,12 @@ export class InputController {
 	}
 
 	/**
-	 * Inline click-to-focus (`tui.mouse`): left-clicks on live subagent cards
-	 * and HUD rows focus that agent in one action, and pointer motion lights up
-	 * the hover band on the target under the cursor. Every SGR report is consumed
-	 * while inline tracking owns the terminal so button/wheel bytes never reach
-	 * the editor as typed input; clicks on chrome simply swallow.
+	 * Inline pointer input (`tui.mouse`): a left-click in the prompt places the
+	 * editor cursor; one on a live subagent card or HUD row focuses that agent;
+	 * pointer motion lights up the hover band on the target under the cursor.
+	 * Every SGR report is consumed while inline tracking owns the terminal so
+	 * button/wheel bytes never reach the editor as typed input; clicks on
+	 * chrome simply swallow.
 	 */
 	#handleInlineMouse(data: string): { consume?: boolean; data?: string } | undefined {
 		if (!data.startsWith("\x1b[<")) return undefined;
@@ -772,8 +774,16 @@ export class InputController {
 		const event = parseSgrMouse(data);
 		if (!event) return undefined;
 		if (event.motion) this.#updateHoverHighlight(event.row);
-		else if (event.leftClick) this.#focusClickedAgent(event.row);
+		else if (event.leftClick && !this.#routeViewportMouse(event)) this.#focusClickedAgent(event.row);
 		return { consume: true };
+	}
+
+	/** Forward a left-click to the pointer-routed component under it (the prompt editor); true when one owns the row. */
+	#routeViewportMouse(event: SgrMouseEvent): boolean {
+		const local = this.#viewportIndex(event.row);
+		if (local === undefined || !this.ctx.routeViewportMouse(event, local)) return false;
+		this.ctx.ui.requestRender();
+		return true;
 	}
 
 	/**
@@ -789,14 +799,19 @@ export class InputController {
 		this.ctx.ui.requestRender();
 	}
 
-	// Candidates under a screen row, or none when the published viewport is
-	// empty (resize transactions) or the row falls outside it: routing stale
-	// spans would highlight or focus an unrelated agent from old rows.
-	#viewportCandidates(screenRow: number): string[] {
+	// Mutable-viewport line under a screen row, or none when the published
+	// viewport is empty (resize transactions) or the row falls outside it:
+	// routing stale spans would highlight, focus, or edit against old rows.
+	#viewportIndex(screenRow: number): number | undefined {
 		const viewport = this.ctx.ui.getMutableViewport();
 		const local = screenRow - viewport.top;
-		if (viewport.length === 0 || local < 0 || local >= viewport.length) return [];
-		return this.ctx.resolveViewportClickCandidates(local);
+		if (viewport.length === 0 || local < 0 || local >= viewport.length) return undefined;
+		return local;
+	}
+
+	#viewportCandidates(screenRow: number): string[] {
+		const local = this.#viewportIndex(screenRow);
+		return local === undefined ? [] : this.ctx.resolveViewportClickCandidates(local);
 	}
 
 	/**

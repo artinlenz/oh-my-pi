@@ -1,5 +1,6 @@
 import type { EditorTopBorder } from "../components/composer/types";
 import { Spacer } from "../components/spacer";
+import type { SgrMouseEvent } from "../mouse";
 import { isInsideTerminalMultiplexer } from "../terminal-multiplexer";
 import { ProcessTerminal, type Terminal } from "../terminal";
 import {
@@ -149,7 +150,14 @@ export interface ViewportClickSpan {
 	end: number;
 	/** Candidate subagent ids for a span-local row. */
 	candidates: (local: number) => string[];
+	/** Mouse router for a span-local row, when the span belongs to a pointer-routed component. */
+	route?: (event: SgrMouseEvent, local: number, col: number) => void;
 }
+
+/** A below-transcript span target: row candidates plus an optional mouse router. */
+type ViewportSpanTarget = Omit<ViewportClickSpan, "start" | "end">;
+
+const NO_CANDIDATES = (): string[] => [];
 
 /**
  * Row-level click target: maps rendered rows to subagent ids. Implemented by
@@ -406,10 +414,16 @@ export class Composer implements TerminalFrameProvider {
 			const end = Math.min(span.end + base, viewportLength);
 			const clamped = Math.max(0, start);
 			if (end > clamped) {
-				// A clipped head must offset the callback: without the skew the
+				// A clipped head must offset the callbacks: without the skew the
 				// first visible row would hit-test as span-local row 0.
 				const skew = clamped - start;
-				spans.push({ start: clamped, end, candidates: (local: number) => span.candidates(local + skew) });
+				const route = span.route;
+				spans.push({
+					start: clamped,
+					end,
+					candidates: (local: number) => span.candidates(local + skew),
+					route: route && ((event, local, col) => route(event, local + skew, col)),
+				});
 			}
 		};
 		for (const span of activeSpans) shift(span, before.length - drop);
@@ -424,22 +438,23 @@ export class Composer implements TerminalFrameProvider {
 
 	/**
 	 * Append one below-transcript root's rows to `after`, recording click spans
-	 * for its row targets in `after` coordinates.
+	 * for its row targets (and the focused prompt editor) in `after`
+	 * coordinates.
 	 *
 	 * Row targets usually nest one level down: chrome roots are plain
-	 * containers (the HUD lives inside `subagentContainer`), and
-	 * `Container.render` is a pure concatenation, so child spans tile the root
-	 * span exactly. Render those children once and share the rows for
-	 * composition and measurement — a second render per frame would duplicate
-	 * render-time side effects (image placement registration). Roots with a
-	 * custom render keep the composed output as the source of truth and measure
-	 * up to the last target.
+	 * containers (the HUD lives inside `subagentContainer`, the editor inside
+	 * `editorContainer`), and `Container.render` is a pure concatenation, so
+	 * child spans tile the root span exactly. Render those children once and
+	 * share the rows for composition and measurement — a second render per
+	 * frame would duplicate render-time side effects (image placement
+	 * registration). Roots with a custom render keep the composed output as the
+	 * source of truth and measure up to the last target.
 	 */
 	#renderBelowRoot(root: Component, width: number, after: string[], spans: ViewportClickSpan[]): void {
 		const start = after.length;
 		const plainContainer = root instanceof Container && root.render === Container.prototype.render;
 		const targets = root instanceof Container ? root.children : [root];
-		const resolves = targets.map(rowTargetCandidates);
+		const resolves = targets.map(target => this.#spanTarget(target));
 		const lastTarget = resolves.findLastIndex(resolve => resolve !== undefined);
 		if (plainContainer) {
 			let offset = start;
@@ -449,7 +464,7 @@ export class Composer implements TerminalFrameProvider {
 				if (index > lastTarget) continue;
 				const resolve = resolves[index];
 				if (resolve !== undefined && childLines.length > 0) {
-					spans.push({ start: offset, end: offset + childLines.length, candidates: resolve });
+					spans.push({ start: offset, end: offset + childLines.length, ...resolve });
 				}
 				offset += childLines.length;
 			}
@@ -462,10 +477,24 @@ export class Composer implements TerminalFrameProvider {
 			const childLines = targets[index] === root ? after.length - start : targets[index]!.render(width).length;
 			const resolve = resolves[index];
 			if (resolve !== undefined && childLines > 0) {
-				spans.push({ start: offset, end: offset + childLines, candidates: resolve });
+				spans.push({ start: offset, end: offset + childLines, ...resolve });
 			}
 			offset += childLines;
 		}
+	}
+
+	/**
+	 * Span target for one below-transcript component: subagent row candidates
+	 * for row targets, or click-to-place routing for the prompt editor while it
+	 * holds focus. An ask dialog or selector swapped into the editor slot — or
+	 * mounted above the editor with focus — leaves the editor inert.
+	 */
+	#spanTarget(target: Component): ViewportSpanTarget | undefined {
+		const candidates = rowTargetCandidates(target);
+		if (candidates !== undefined) return { candidates };
+		const editor = this.#editor;
+		if (target !== editor || !editor.focused) return undefined;
+		return { candidates: NO_CANDIDATES, route: (event, local, col) => editor.routeMouse(event, local, col) };
 	}
 
 	/**
@@ -501,6 +530,23 @@ export class Composer implements TerminalFrameProvider {
 	 */
 	viewportClickCandidates(index: number): string[] {
 		return routeViewportClick(this.#lastClickSpans, index);
+	}
+
+	/**
+	 * Forward a mouse event on a mutable-viewport line to the pointer-routed
+	 * component painted there (the focused prompt editor), at its span-local
+	 * row and the event's column. False when no such component owns the line,
+	 * so callers can fall back to click-to-focus.
+	 */
+	routeViewportMouse(event: SgrMouseEvent, index: number): boolean {
+		if (!Number.isInteger(index) || index < 0) return false;
+		for (const span of this.#lastClickSpans) {
+			if (index < span.start || index >= span.end) continue;
+			if (span.route === undefined) return false;
+			span.route(event, index - span.start, event.col);
+			return true;
+		}
+		return false;
 	}
 
 	/**

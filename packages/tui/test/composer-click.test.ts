@@ -5,6 +5,9 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { Container, type Component } from "@oh-my-pi/pi-tui";
 import { VirtualTerminal } from "./virtual-terminal";
 import { routeViewportClick, type ViewportClickSpan } from "@oh-my-pi/pi-tui/prompt/composer";
+import { parseSgrMouse } from "@oh-my-pi/pi-tui/mouse";
+
+const LEFT_CLICK = parseSgrMouse("\x1b[<0;1;1M")!;
 
 function span(start: number, end: number, ids: string[]): ViewportClickSpan {
 	return { start, end, candidates: () => ids };
@@ -215,6 +218,90 @@ describe("composer chrome span recording", () => {
 			expect(hudRow).toBeGreaterThanOrEqual(0);
 			expect(composer.viewportClickCandidates(hudRow)).toEqual(["AgentH"]);
 			expect(first.renders).toBe(1);
+		} finally {
+			composer.stop();
+		}
+	});
+});
+
+describe("composer prompt click routing", () => {
+	beforeAll(() => {
+		initTheme();
+	});
+
+	function mount(rows: number) {
+		const term = new VirtualTerminal(80, 24);
+		const composer = new Composer({ terminal: term, preferences: { ...COMPOSER_DEFAULTS, quiet: true } });
+		composer.start();
+		const slot = new Container();
+		slot.addChild(composer.editor);
+		composer.setRuntimeChildren([new TranscriptContainer(), slot]);
+		const frame = (): string[] =>
+			composer.renderFrame({ columns: 80, rows }).viewport.map(line => Bun.stripANSI(line));
+		/** Click the first cell of `needle` on its viewport row; false when nothing routable owns the row. */
+		const clickOn = (viewport: readonly string[], needle: string): boolean => {
+			const row = viewport.findIndex(line => line.includes(needle));
+			expect(row).toBeGreaterThanOrEqual(0);
+			return composer.routeViewportMouse({ ...LEFT_CLICK, col: viewport[row]!.indexOf(needle) }, row);
+		};
+		return { composer, slot, frame, clickOn };
+	}
+
+	it("routes clicks to the focused prompt editor only", () => {
+		const { composer, slot, frame, clickOn } = mount(24);
+		try {
+			const editor = composer.editor;
+			editor.setText("alpha beta");
+			expect(clickOn(frame(), "beta")).toBe(true);
+			expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+
+			// A dialog mounted above the editor holds focus: the editor stays inert.
+			const dialog = new CountingBlock(["dialog row"]);
+			slot.clear();
+			slot.addChild(dialog);
+			slot.addChild(editor);
+			composer.ui.setFocus(dialog);
+			expect(clickOn(frame(), "alpha")).toBe(false);
+			expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+
+			// Replaced in the slot: nothing routes to it.
+			slot.clear();
+			slot.addChild(dialog);
+			expect(clickOn(frame(), "dialog row")).toBe(false);
+			expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("leaves the draft alone when a dialog takes the slot before the next frame", () => {
+		const { composer, slot, frame, clickOn } = mount(24);
+		try {
+			const editor = composer.editor;
+			editor.setText("alpha beta");
+			const painted = frame();
+			// Swap in a dialog and move focus, but click before any new frame is composed:
+			// the last frame's spans still cover the editor rows.
+			const dialog = new CountingBlock(["dialog row"]);
+			slot.clear();
+			slot.addChild(dialog);
+			composer.ui.setFocus(dialog);
+			clickOn(painted, "alpha");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 10 });
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("offsets editor rows past a clipped viewport head", () => {
+		const { composer, frame, clickOn } = mount(3);
+		try {
+			const editor = composer.editor;
+			editor.setText("line0\nline1\nline2\nline3");
+			const viewport = frame();
+			expect(viewport.some(line => line.includes("line0"))).toBe(false);
+			expect(clickOn(viewport, "line2")).toBe(true);
+			expect(editor.getCursor()).toEqual({ line: 2, col: 0 });
 		} finally {
 			composer.stop();
 		}
